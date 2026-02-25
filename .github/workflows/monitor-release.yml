@@ -20,14 +20,15 @@ jobs:
           echo "URL=${{ github.event.release.html_url }}" >> $GITHUB_ENV
 
       - name: Send DingTalk notification
-        uses: zcong1993/dingtalk-action@v2
+        uses: qianxiaobei/dingtalk-action@v1.0.0
         with:
           # 替换为你的钉钉机器人 Webhook 地址
-          url: ${{ secrets.DINGTALK_WEBHOOK }}
+          webhook: ${{ secrets.DINGTALK_WEBHOOK }}
           # 自定义通知内容格式
-          msg: |
-            🚨 OpenClaw 新版本发布 🚨
-            版本号: ${{ env.VERSION }}
-            标题: ${{ env.TITLE }}
-            更新内容: ${{ env.DESCRIPTION }}
-            查看详情: ${{ env.URL }}
+          msgtype: markdown
+          content: |
+            ### 🚨 OpenClaw 新版本发布 🚨
+            - **版本号**: ${{ env.VERSION }}
+            - **标题**: ${{ env.TITLE }}
+            - **更新内容**: ${{ env.DESCRIPTION }}
+            - **查看详情**: [点击跳转](${{ env.URL }})
