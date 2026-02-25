@@ -1,67 +1,40 @@
 name: Monitor OpenClaw Release
 on:
-  # 监听 Release 发布事件
   release:
     types: [published]
-  # 可选：手动触发测试
   workflow_dispatch:
 
 jobs:
   send-notification:
     runs-on: ubuntu-latest
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'  # 使用最新版 Python
-
-      - name: Send DingTalk notification via Python
+      - name: Send DingTalk notification (Shell only)
         env:
-          # 从 Secrets 读取钉钉 Webhook 地址
-          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          # 提取版本信息作为环境变量
-          VERSION: ${{ github.event.release.tag_name }}
-          TITLE: ${{ github.event.release.name }}
-          DESCRIPTION: ${{ github.event.release.body }}
-          URL: ${{ github.event.release.html_url }}
+          WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          VERSION: ${{ github.event.release.tag_name || '测试版本' }}
+          TITLE: ${{ github.event.release.name || '测试标题' }}
+          DESCRIPTION: ${{ github.event.release.body || '无更新描述' }}
+          URL: ${{ github.event.release.html_url || '#' }}
         run: |
-          # 编写 Python 脚本并执行
-          python - <<EOF
-          import requests
-          import os
-          import json
-
-          # 获取环境变量中的配置
-          webhook = os.getenv('DINGTALK_WEBHOOK')
-          version = os.getenv('VERSION', '测试版本')
-          title = os.getenv('TITLE', '测试标题')
-          description = os.getenv('DESCRIPTION', '无更新描述').replace('\\n', '<br>')  # 换行符替换为 HTML 换行
-          url = os.getenv('URL', '')
-
-          # 钉钉消息模板（markdown 格式）
-          msg = {
-              "msgtype": "markdown",
-              "markdown": {
-                  "title": "OpenClaw 新版本发布",
-                  "text": f"""### 🚨 OpenClaw 新版本发布 🚨
-- **版本号**: {version}
-- **标题**: {title}
-- **更新内容**: {description}
-- **查看详情**: [点击跳转]({url})
-                  """
-              }
+          # 处理换行符，替换为钉钉支持的<br>
+          DESCRIPTION=$(echo "$DESCRIPTION" | sed ':a;N;$!ba;s/\n/<br>/g')
+          
+          # 构造钉钉消息的JSON内容
+          JSON_PAYLOAD=$(cat <<EOF
+          {
+            "msgtype": "markdown",
+            "markdown": {
+              "title": "OpenClaw 版本更新",
+              "text": "### 🚨 OpenClaw 新版本发布 🚨<br>- **版本号**: $VERSION<br>- **标题**: $TITLE<br>- **更新内容**: $DESCRIPTION<br>- **查看详情**: [点击跳转]($URL)"
+            }
           }
-
-          # 发送请求到钉钉机器人
-          try:
-              response = requests.post(
-                  webhook,
-                  data=json.dumps(msg),
-                  headers={'Content-Type': 'application/json'}
-              )
-              response.raise_for_status()  # 抛出 HTTP 错误
-              print("通知发送成功！响应：", response.text)
-          except Exception as e:
-              print("通知发送失败：", str(e))
-              raise e  # 让 workflow 标记为失败
           EOF
+          )
+          
+          # 发送POST请求到钉钉机器人
+          curl -X POST "$WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD"
+          
+          # 输出响应，方便排查问题
+          echo "发送完成，Payload: $JSON_PAYLOAD"
