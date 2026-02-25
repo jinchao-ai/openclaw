@@ -1,0 +1,33 @@
+name: Monitor OpenClaw Release
+on:
+  # 监听 Release 发布事件
+  release:
+    types: [published]
+  # 可选：手动触发测试
+  workflow_dispatch:
+
+jobs:
+  send-notification:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release_info
+        run: |
+          # 提取版本更新的关键信息
+          echo "VERSION=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+          echo "TITLE=${{ github.event.release.name }}" >> $GITHUB_ENV
+          echo "DESCRIPTION=${{ github.event.release.body }}" >> $GITHUB_ENV
+          echo "URL=${{ github.event.release.html_url }}" >> $GITHUB_ENV
+
+      - name: Send DingTalk notification
+        uses: zcong1993/dingtalk-action@v2
+        with:
+          # 替换为你的钉钉机器人 Webhook 地址
+          url: ${{ secrets.DINGTALK_WEBHOOK }}
+          # 自定义通知内容格式
+          msg: |
+            🚨 OpenClaw 新版本发布 🚨
+            版本号: ${{ env.VERSION }}
+            标题: ${{ env.TITLE }}
+            更新内容: ${{ env.DESCRIPTION }}
+            查看详情: ${{ env.URL }}
