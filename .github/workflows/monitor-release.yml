@@ -2,7 +2,7 @@ name: Monitor OpenClaw Release (Original Repo)
 on:
   # 定时检查：每小时一次（可改，比如 */30 * * * * 每30分钟）
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/30 * * * *'
   # 保留手动触发，方便测试
   workflow_dispatch:
 
