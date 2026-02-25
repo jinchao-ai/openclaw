@@ -8,9 +8,12 @@ jobs:
   send-notification:
     runs-on: ubuntu-latest
     steps:
-      - name: Send DingTalk notification (Shell only)
+      - name: Send DingTalk notification (with signature)
         env:
+          # 钉钉机器人 Webhook 地址（无签名参数）
           WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          # 钉钉机器人加签密钥（在创建机器人时获取，需新增到 Secrets）
+          SECRET: ${{ secrets.DINGTALK_SECRET }}
           VERSION: ${{ github.event.release.tag_name || '测试版本' }}
           TITLE: ${{ github.event.release.name || '测试标题' }}
           DESCRIPTION: ${{ github.event.release.body || '无更新描述' }}
@@ -19,7 +22,20 @@ jobs:
           # 处理换行符，替换为钉钉支持的<br>
           DESCRIPTION=$(echo "$DESCRIPTION" | sed ':a;N;$!ba;s/\n/<br>/g')
           
-          # 构造钉钉消息的JSON内容
+          # 1. 生成时间戳和签名（解决310000错误）
+          timestamp=$(date +%s)
+          secret="$SECRET"
+          # 拼接字符串：timestamp + "\n" + secret
+          string_to_sign="$timestamp\n$secret"
+          # 用HMAC-SHA256加密并base64编码
+          sign=$(echo -n "$string_to_sign" | openssl dgst -sha256 -hmac "$secret" -binary | base64)
+          # URL编码签名（必须）
+          sign_urlencoded=$(echo "$sign" | sed -e 's/+/\%2B/g' -e 's/\//\%2F/g' -e 's/=/\%3D/g')
+          
+          # 2. 拼接带签名的完整Webhook地址
+          full_webhook="$WEBHOOK×tamp=$timestamp&sign=$sign_urlencoded"
+          
+          # 3. 构造钉钉消息的JSON内容
           JSON_PAYLOAD=$(cat <<EOF
           {
             "msgtype": "markdown",
@@ -31,10 +47,13 @@ jobs:
           EOF
           )
           
-          # 发送POST请求到钉钉机器人
-          curl -X POST "$WEBHOOK" \
+          # 4. 发送POST请求到钉钉机器人（带签名）
+          curl -X POST "$full_webhook" \
             -H "Content-Type: application/json" \
             -d "$JSON_PAYLOAD"
           
-          # 输出响应，方便排查问题
-          echo "发送完成，Payload: $JSON_PAYLOAD"
+          # 输出日志，方便排查
+          echo "时间戳: $timestamp"
+          echo "签名: $sign"
+          echo "完整Webhook: $full_webhook"
+          echo "发送的内容: $JSON_PAYLOAD"
