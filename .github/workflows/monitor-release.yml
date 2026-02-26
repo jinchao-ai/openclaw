@@ -1,6 +1,6 @@
 name: Monitor OpenClaw Release (Original Repo)
 on:
-  # 定时检查：每小时一次（可改，比如 */30 * * * * 每30分钟）
+  # 每30分钟检查一次原仓库版本
   schedule:
     - cron: '*/30 * * * *'
   # 保留手动触发，方便测试
@@ -10,49 +10,52 @@ jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     steps:
+      # 安装jq工具（必须，用于安全构造JSON）
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Check latest release of original OpenClaw
         env:
-          # 替换为原 openclaw 仓库的地址（比如 owner/openclaw）
           ORIGINAL_REPO: "openclaw/openclaw"
-          # 存储上次记录的版本号（用 GitHub Cache 持久化）
-          CACHE_KEY: "openclaw-latest-release"
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
         run: |
-          # 1. 获取原仓库最新 Release 信息
-          LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$ORIGINAL_REPO/releases/latest")
-          # 提取版本号和关键信息
-          LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r .tag_name)
-          LATEST_TITLE=$(echo "$LATEST_RELEASE" | jq -r .name)
-          LATEST_DESCRIPTION=$(echo "$LATEST_RELEASE" | jq -r .body | tr '\n' ' ')
-          LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r .html_url)
+          # 1. 获取原仓库最新 Release 信息（带错误处理）
+          LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/$ORIGINAL_REPO/releases/latest" || echo '{"tag_name":"null","name":"无标题","body":"无更新描述","html_url":"https://github.com/openclaw/openclaw"}')
           
-          # 2. 获取上次记录的版本号（首次运行为空）
-          LAST_VERSION=$(cat "$HOME/$CACHE_KEY" 2>/dev/null || echo "")
+          # 2. 提取关键信息（用jq安全解析，避免格式错误）
+          LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
+          LATEST_TITLE=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
+          # 处理更新描述：替换特殊字符+截断长度，避免JSON报错
+          LATEST_DESCRIPTION=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | tr -d '"\\' | tr '\n' ' ' | cut -c 1-300)
+          LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
           
           # 3. 对比版本号，有更新才发通知
-          if [ "$LATEST_VERSION" != "$LAST_VERSION" ] && [ "$LATEST_VERSION" != "null" ]; then
-            echo "发现新版本：$LATEST_VERSION（旧版本：$LAST_VERSION）"
+          if [ "$LATEST_VERSION" != "null" ]; then
+            echo "发现新版本：$LATEST_VERSION"
             
-            # 4. 发送钉钉通知（保留你之前的逻辑）
-            JSON_PAYLOAD='{
-              "msgtype":"text",
-              "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：'$LATEST_VERSION'\n标题：'$LATEST_TITLE'\n更新内容：'$LATEST_DESCRIPTION'\n查看详情：'$LATEST_URL'"}
-            }'
+            # 4. 用jq构造合法的JSON（核心修复：避免语法错误）
+            JSON_PAYLOAD=$(jq -n \
+              --arg version "$LATEST_VERSION" \
+              --arg title "$LATEST_TITLE" \
+              --arg desc "$LATEST_DESCRIPTION" \
+              --arg url "$LATEST_URL" \
+              '{
+                "msgtype": "text",
+                "text": {
+                  "content": "🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($version)\n标题：\($title)\n更新内容：\($desc)\n查看详情：\($url)"
+                }
+              }')
             
-            # 替换为你的钉钉 Webhook（已去掉加签）
-            curl -X POST "${{ secrets.DINGTALK_WEBHOOK }}" \
-              -H "Content-Type: application/json" \
+            # 打印JSON内容（方便调试）
+            echo "发送的JSON内容：$JSON_PAYLOAD"
+            
+            # 5. 发送钉钉通知（确保Content-Type正确）
+            curl -X POST "$DINGTALK_WEBHOOK" \
+              -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
             
-            # 5. 保存最新版本号到缓存
-            echo "$LATEST_VERSION" > "$HOME/$CACHE_KEY"
+            # 保存版本号（简单文件存储，避免缓存复杂问题）
+            echo "$LATEST_VERSION" > ~/openclaw-latest-version.txt
           else
             echo "无新版本，当前最新：$LATEST_VERSION"
           fi
-          
-      - name: Save version cache
-        uses: actions/cache@v4
-        with:
-          path: ~/openclaw-latest-release
-          key: ${{ runner.os }}-openclaw-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-openclaw-
