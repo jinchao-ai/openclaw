@@ -12,36 +12,44 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # 2. 恢复上次缓存的版本号（核心：固定缓存key+路径，确保每次能读取到）
-      - name: Restore last sent version from cache
-        id: cache-version
-        uses: actions/cache@v4
-        with:
-          path: ~/openclaw-last-version.txt  # 固定路径存储版本号
-          key: openclaw-version-cache-${{ runner.os }}  # 固定缓存key，不随run_id变化
-          restore-keys: |
-            openclaw-version-cache-${{ runner.os }}
-
-      # 3. 检查版本+对比缓存+发送通知
-      - name: Check release and send notify (avoid duplicate)
-        env:
-          ORIGINAL_REPO: "openclaw/openclaw"
-          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      # 2. 获取原仓库最新版本
+      - name: Get latest release from original repo
+        id: get-latest
         run: |
-          # 读取缓存的历史版本号（首次运行为空）
-          LAST_VERSION=$(cat ~/openclaw-last-version.txt 2>/dev/null || echo "")
-          echo "上次推送的版本号：$LAST_VERSION"
-
-          # 获取原仓库最新版本（带错误处理）
-          LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/$ORIGINAL_REPO/releases/latest" || echo '{"tag_name":"null"}')
+          # 获取最新版本信息（带错误处理）
+          LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null"}')
           LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
-          echo "原仓库最新版本号：$LATEST_VERSION"
+          # 输出为step输出变量，供后续步骤使用
+          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "最新版本号：$LATEST_VERSION"
 
-          # 核心逻辑：仅当版本更新、非空、且与历史版本不同时推送
+      # 3. 读取上次推送的版本号（用GitHub变量持久化，无冲突）
+      - name: Get last notified version
+        id: get-last
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # 读取仓库的环境变量（首次运行返回空）
+          LAST_VERSION=$(gh variable get OPENCLAW_LAST_VERSION --repo $REPO 2>/dev/null || echo "")
+          echo "last_version=$LAST_VERSION" >> $GITHUB_OUTPUT
+          echo "上次推送版本号：$LAST_VERSION"
+
+      # 4. 版本对比+发送通知
+      - name: Compare version and send DingTalk notify
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          LATEST_VERSION: ${{ steps.get-latest.outputs.latest_version }}
+          LAST_VERSION: ${{ steps.get-last.outputs.last_version }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # 核心逻辑：仅版本更新且非空时推送
           if [ "$LATEST_VERSION" != "null" ] && [ "$LATEST_VERSION" != "$LAST_VERSION" ]; then
             echo "检测到新版本 $LATEST_VERSION，开始推送通知..."
             
-            # 提取完整信息
+            # 提取完整版本信息
+            LATEST_RELEASE=$(curl -s "https://api.github.com/repos/openclaw/openclaw/releases/latest")
             LATEST_TITLE=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
             LATEST_DESCRIPTION=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | tr -d '"\\' | tr '\n' ' ' | cut -c 1-300)
             LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
@@ -57,21 +65,14 @@ jobs:
                 "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($ver)\n标题：\($title)\n更新内容：\($desc)\n查看详情：\($url)"}
               }')
 
-            # 发送通知
+            # 发送钉钉通知
             curl -X POST "$DINGTALK_WEBHOOK" \
               -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
 
-            # 保存新版本号到文件（覆盖历史版本）
-            echo "$LATEST_VERSION" > ~/openclaw-last-version.txt
-            echo "通知推送成功，已更新缓存版本号为：$LATEST_VERSION"
+            # 持久化新版本号到GitHub环境变量（核心：替代缓存，无冲突）
+            echo "更新上次推送版本号为：$LATEST_VERSION"
+            gh variable set OPENCLAW_LAST_VERSION --repo $REPO --body "$LATEST_VERSION"
           else
             echo "无新版本（当前版本：$LATEST_VERSION），无需推送"
           fi
-
-      # 4. 强制保存新版本号到缓存（确保下次能读取到）
-      - name: Save latest version to cache
-        uses: actions/cache/save@v4
-        with:
-          path: ~/openclaw-last-version.txt
-          key: openclaw-version-cache-${{ runner.os }}
