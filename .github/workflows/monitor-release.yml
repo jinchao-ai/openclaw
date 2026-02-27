@@ -7,36 +7,41 @@ on:
 jobs:
   check-and-notify:
     runs-on: ubuntu-latest
+    permissions:
+      # 显式声明需要的权限（关键：解决403）
+      repository-variables: write  # 写入仓库变量
+      contents: read               # 读取仓库内容
     steps:
       # 1. 安装依赖
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
       # 2. 获取原仓库最新版本
-      - name: Get latest release from original repo
+      - name: Get latest release
         id: get-latest
         run: |
-          # 获取最新版本信息（带错误处理）
           LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null"}')
           LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
-          # 输出为step输出变量，供后续步骤使用
           echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          echo "最新版本号：$LATEST_VERSION"
+          echo "最新版本：$LATEST_VERSION"
 
-      # 3. 读取上次推送的版本号（用GitHub变量持久化，无冲突）
+      # 3. 读取历史版本号（用API替代gh cli，避免权限问题）
       - name: Get last notified version
         id: get-last
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          # 读取仓库的环境变量（首次运行返回空）
-          LAST_VERSION=$(gh variable get OPENCLAW_LAST_VERSION --repo $REPO 2>/dev/null || echo "")
+          # 用GitHub API读取变量（比gh cli更稳定）
+          RESPONSE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION")
+          # 提取版本号（无变量时返回空）
+          LAST_VERSION=$(echo "$RESPONSE" | jq -r '.value // ""')
           echo "last_version=$LAST_VERSION" >> $GITHUB_OUTPUT
-          echo "上次推送版本号：$LAST_VERSION"
+          echo "上次推送版本：$LAST_VERSION"
 
-      # 4. 版本对比+发送通知
-      - name: Compare version and send DingTalk notify
+      # 4. 版本对比+发送通知+更新变量
+      - name: Send notify and update variable
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           LATEST_VERSION: ${{ steps.get-latest.outputs.latest_version }}
@@ -44,17 +49,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          # 核心逻辑：仅版本更新且非空时推送
           if [ "$LATEST_VERSION" != "null" ] && [ "$LATEST_VERSION" != "$LAST_VERSION" ]; then
-            echo "检测到新版本 $LATEST_VERSION，开始推送通知..."
+            echo "检测到新版本 $LATEST_VERSION，推送通知..."
             
-            # 提取完整版本信息
+            # 提取版本信息+发送钉钉通知（逻辑不变）
             LATEST_RELEASE=$(curl -s "https://api.github.com/repos/openclaw/openclaw/releases/latest")
             LATEST_TITLE=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
             LATEST_DESCRIPTION=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | tr -d '"\\' | tr '\n' ' ' | cut -c 1-300)
             LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
 
-            # 构造合法JSON
             JSON_PAYLOAD=$(jq -n \
               --arg ver "$LATEST_VERSION" \
               --arg title "$LATEST_TITLE" \
@@ -65,14 +68,16 @@ jobs:
                 "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($ver)\n标题：\($title)\n更新内容：\($desc)\n查看详情：\($url)"}
               }')
 
-            # 发送钉钉通知
             curl -X POST "$DINGTALK_WEBHOOK" \
               -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
 
-            # 持久化新版本号到GitHub环境变量（核心：替代缓存，无冲突）
-            echo "更新上次推送版本号为：$LATEST_VERSION"
-            gh variable set OPENCLAW_LAST_VERSION --repo $REPO --body "$LATEST_VERSION"
+            # 用API更新变量（替代gh cli，更兼容权限）
+            echo "更新仓库变量为：$LATEST_VERSION"
+            curl -s -X PUT -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION" \
+              -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
           else
-            echo "无新版本（当前版本：$LATEST_VERSION），无需推送"
+            echo "无新版本，无需推送"
           fi
