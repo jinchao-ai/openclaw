@@ -9,41 +9,58 @@ jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     steps:
-      # 1. 仅安装基础依赖（移除Python，改用curl直接调用翻译API）
+      # 1. 安装基础依赖
       - name: Install basic dependencies
         run: sudo apt-get update && sudo apt-get install -y jq curl
 
-      # 2. 获取最新版本+完整翻译（无Python，纯curl调用翻译API）
-      - name: Get latest release and full translate
+      # 2. 获取最新版本+保底翻译（原文+关键词替换，确保内容不空）
+      - name: Get latest release and fallback translate
         id: get-latest
         run: |
           # 获取原仓库最新Release（保留原始换行）
           LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null","name":"No Title","body":"No Description","html_url":"https://github.com/openclaw/openclaw"}')
           
-          # 提取核心字段（转义特殊字符，适配API调用）
+          # 提取核心字段（先保留原文，避免为空）
           LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
-          LATEST_TITLE_EN=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"' | jq -sRr @uri) # URL编码
-          LATEST_BODY_EN=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | jq -sRr @uri)   # URL编码
+          LATEST_TITLE_RAW=$(echo "$LATEST_RELEASE" | jq -r '.name // "无版本标题"')
+          LATEST_BODY_RAW=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新内容"' | sed -e 's/\r//g' -e 's/\n\{2,\}/\n/g') # 清理多余换行
           LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
 
-          # ========== 核心：纯curl调用翻译API（无Python，无语法错误） ==========
-          # 翻译标题（开源API，无需密钥，稳定可用）
-          LATEST_TITLE_CN=$(curl -s "https://fanyi.youdao.com/translate?&doctype=json&type=AUTO&i=$LATEST_TITLE_EN" | jq -r '.translateResult[0][0].tgt // .translateResult[0][0].src')
-          
-          # 翻译正文（保留换行）
-          LATEST_BODY_CN=$(curl -s "https://fanyi.youdao.com/translate?&doctype=json&type=AUTO&i=$LATEST_BODY_EN" | jq -r '.translateResult[0][0].tgt // .translateResult[0][0].src')
+          # ========== 核心：保底翻译（关键词替换+原文兜底，确保内容不空） ==========
+          # 1. 标题翻译（关键词替换+原文兜底）
+          LATEST_TITLE_CN=$(echo "$LATEST_TITLE_RAW" | \
+            sed -e 's/Performance/性能/g' -e 's/Optimization/优化/g' -e 's/Security/安全/g' \
+                -e 's/Fix/修复/g' -e 's/Update/更新/g' -e 's/Feature/功能/g' \
+                -e 's/Release/发布/g' -e 's/Bug/缺陷/g' -e 's/Support/支持/g')
+          # 若翻译后为空，用原文兜底
+          if [ -z "$LATEST_TITLE_CN" ] || [ "$LATEST_TITLE_CN" = " " ]; then
+            LATEST_TITLE_CN="$LATEST_TITLE_RAW"
+          fi
 
-          # 还原换行符（API返回的\n转为真实换行）
-          LATEST_TITLE_CN=$(echo "$LATEST_TITLE_CN" | sed -e 's/\\n/\n/g')
-          LATEST_BODY_CN=$(echo "$LATEST_BODY_CN" | sed -e 's/\\n/\n/g')
+          # 2. 正文翻译（关键词替换+保留原文结构，确保内容不空）
+          LATEST_BODY_CN=$(echo "$LATEST_BODY_RAW" | \
+            sed -e 's/performance/性能/g' -e 's/optimization/优化/g' -e 's/security/安全/g' \
+                -e 's/fix/修复/g' -e 's/update/更新/g' -e 's/feature/功能/g' \
+                -e 's/bug/缺陷/g' -e 's/support/支持/g' -e 's/add/新增/g' \
+                -e 's/cpu/CPU/g' -e 's/memory/内存/g' -e 's/windows/Windows系统/g' \
+                -e 's/macos/macOS系统/g' -e 's/linux/Linux系统/g' -e 's/stability/稳定性/g')
+          # 若翻译后为空，用原文兜底
+          if [ -z "$LATEST_BODY_CN" ] || [ "$LATEST_BODY_CN" = " " ]; then
+            LATEST_BODY_CN="$LATEST_BODY_RAW"
+          fi
 
-          # 输出变量（转义换行符，适配GitHub Output）
+          # 输出变量（转义换行符，适配钉钉）
           echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
           echo "title_cn=$(echo "$LATEST_TITLE_CN" | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g')" >> $GITHUB_OUTPUT
           echo "body_cn=$(echo "$LATEST_BODY_CN" | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g')" >> $GITHUB_OUTPUT
           echo "url=$LATEST_URL" >> $GITHUB_OUTPUT
 
-      # 3. 读取历史版本号（防重复推送）
+          # 调试：打印原始内容和翻译后内容
+          echo "原始标题：$LATEST_TITLE_RAW"
+          echo "翻译标题：$LATEST_TITLE_CN"
+          echo "原始正文（前100字符）：$(echo "$LATEST_BODY_RAW" | head -c 100)"
+
+      # 3. 读取历史版本号
       - name: Get last notified version
         id: get-last
         env:
@@ -61,8 +78,8 @@ jobs:
           echo "last_version=$LAST_VERSION" >> $GITHUB_OUTPUT
           echo "上次推送版本：$LAST_VERSION"
 
-      # 4. 发送完整翻译内容到钉钉（格式美观+换行生效）
-      - name: Send full translated content to DingTalk
+      # 4. 发送消息（内容不空+格式美观）
+      - name: Send non-empty content to DingTalk
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           LATEST_VERSION: ${{ steps.get-latest.outputs.latest_version }}
@@ -74,9 +91,9 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           if [ "$LATEST_VERSION" != "null" ] && [ "$LATEST_VERSION" != "$LAST_VERSION" ]; then
-            echo "检测到新版本 $LATEST_VERSION，推送完整翻译内容到钉钉..."
+            echo "检测到新版本 $LATEST_VERSION，推送内容到钉钉..."
             
-            # 构造钉钉消息（换行符正常生效，格式美观）
+            # 构造钉钉消息（强制内容不空，格式美观）
             JSON_PAYLOAD=$(jq -n \
               --arg ver "$LATEST_VERSION" \
               --arg title "$TITLE_CN" \
@@ -84,15 +101,15 @@ jobs:
               --arg url "$URL" \
               '{
                 "msgtype":"text",
-                "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($ver)\n版本标题：\($title)\n\n更新内容（完整翻译）：\n\($body)\n\n查看完整详情：\($url)"}
+                "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($ver)\n版本标题：\($title)\n\n更新内容：\n\($body)\n\n查看完整详情：\($url)"}
               }')
 
-            # 发送钉钉通知（强制UTF-8编码）
+            # 发送钉钉通知
             curl -X POST "$DINGTALK_WEBHOOK" \
               -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
 
-            # 更新版本号变量（先删后建，避免404）
+            # 更新版本号变量
             curl -s -X DELETE -H "Authorization: token $PAT_TOKEN" \
               "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION"
             curl -s -X POST -H "Authorization: token $PAT_TOKEN" \
@@ -100,7 +117,7 @@ jobs:
               "https://api.github.com/repos/$REPO/actions/variables" \
               -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
             
-            echo "完整翻译内容已推送至钉钉，版本号已保存"
+            echo "消息已推送至钉钉，版本号已保存"
           else
             echo "无新版本（当前版本：$LATEST_VERSION），无需推送"
           fi
