@@ -1,7 +1,7 @@
 name: Monitor OpenClaw Release (Original Repo)
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 8,20 * * *'
   workflow_dispatch:
 
 jobs:
