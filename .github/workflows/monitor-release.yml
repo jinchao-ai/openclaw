@@ -8,68 +8,63 @@ jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     steps:
-      # 1. 安装依赖（jq+翻译工具）
+      # 1. 安装依赖
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y jq curl
-          # 安装开源翻译工具（无需密钥）
           sudo wget -O /usr/local/bin/translate https://raw.githubusercontent.com/soimort/translate-shell/master/translate
           sudo chmod +x /usr/local/bin/translate
 
-      # 2. 获取原仓库最新版本+英文转中文总结
-      - name: Get latest release and translate to Chinese
+      # 2. 获取最新版本+翻译为中文
+      - name: Get latest release and translate
         id: get-latest
         run: |
-          # 获取原仓库最新Release原始数据
           LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null","name":"No Title","body":"No Description","html_url":"https://github.com/openclaw/openclaw"}')
-          
-          # 提取核心英文字段
           LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
           LATEST_TITLE_EN=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
           LATEST_BODY_EN=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"')
           LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
 
-          # ========== 核心：英文转中文 + 结构化总结（单行拼接，避免YAML语法错误） ==========
-          # 1. 标题翻译
+          # 翻译+结构化总结
           LATEST_TITLE_CN=$(echo "$LATEST_TITLE_EN" | translate -s en:zh-CN | tr -d '\n' || echo "$LATEST_TITLE_EN")
-          
-          # 2. 提取英文核心内容并翻译
           SUMMARY_EN=$(echo "$LATEST_BODY_EN" | grep -E -i 'performance|feature|bug|fix|security|optimize|new|update|add' | head -5 | tr '\n' ' ')
           SUMMARY_CN=$(echo "$SUMMARY_EN" | translate -s en:zh-CN | tr -d '\n' || echo "无核心更新内容")
           
-          # 3. 结构化中文总结（单行拼接，用\n替代换行，避免YAML解析错误）
           PERF_OPTIMIZE=$(echo "$SUMMARY_CN" | grep -i '性能\|优化\|提速' || echo '无')
           NEW_FEATURE=$(echo "$SUMMARY_CN" | grep -i '功能\|新增\|支持' || echo '无')
           BUG_FIX=$(echo "$SUMMARY_CN" | grep -i '修复\|bug\|错误' || echo '无')
           SECURITY_UPDATE=$(echo "$SUMMARY_CN" | grep -i '安全\|加固\|防护' || echo '无')
           FINAL_SUMMARY_CN="1. 性能优化：$PERF_OPTIMIZE\n2. 功能新增：$NEW_FEATURE\n3. Bug修复：$BUG_FIX\n4. 安全更新：$SECURITY_UPDATE"
 
-          # 输出为step变量
           echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
           echo "title_cn=$LATEST_TITLE_CN" >> $GITHUB_OUTPUT
           echo "summary_cn=$FINAL_SUMMARY_CN" >> $GITHUB_OUTPUT
           echo "url=$LATEST_URL" >> $GITHUB_OUTPUT
 
-          # 调试信息
-          echo "版本号：$LATEST_VERSION"
-          echo "中文标题：$LATEST_TITLE_CN"
-          echo "中文总结：$FINAL_SUMMARY_CN"
-
-      # 3. 读取历史版本号（防重复推送）
+      # 3. 读取历史版本号（兼容变量不存在）
       - name: Get last notified version
         id: get-last
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          RESPONSE=$(curl -s -H "Authorization: token $PAT_TOKEN" \
+          # 读取变量（404时返回空）
+          RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: token $PAT_TOKEN" \
             "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION")
-          LAST_VERSION=$(echo "$RESPONSE" | jq -r '.value // ""')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          # 变量存在则提取值，不存在则为空
+          if [ "$HTTP_CODE" = "200" ]; then
+            LAST_VERSION=$(echo "$RESPONSE_BODY" | jq -r '.value // ""')
+          else
+            LAST_VERSION=""
+          fi
           echo "last_version=$LAST_VERSION" >> $GITHUB_OUTPUT
           echo "上次推送版本：$LAST_VERSION"
 
-      # 4. 发送中文总结到钉钉
-      - name: Send Chinese summary to DingTalk
+      # 4. 发送通知+创建/更新变量（核心修复：兼容404）
+      - name: Send notify and manage variable
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           LATEST_VERSION: ${{ steps.get-latest.outputs.latest_version }}
@@ -81,9 +76,9 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           if [ "$LATEST_VERSION" != "null" ] && [ "$LATEST_VERSION" != "$LAST_VERSION" ]; then
-            echo "检测到新版本，推送中文总结到钉钉..."
+            echo "检测到新版本 $LATEST_VERSION，推送中文总结到钉钉..."
             
-            # 构造中文钉钉消息（用\n实现换行，兼容JSON格式）
+            # 构造钉钉消息
             JSON_PAYLOAD=$(jq -n \
               --arg ver "$LATEST_VERSION" \
               --arg title "$TITLE_CN" \
@@ -99,13 +94,29 @@ jobs:
               -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
 
-            # 更新版本号到仓库变量
-            curl -s -X PUT -H "Authorization: token $PAT_TOKEN" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION" \
-              -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
+            # ========== 修复：判断变量是否存在，不存在则创建，存在则更新 ==========
+            # 先检查变量是否存在
+            CHECK_RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: token $PAT_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION")
+            CHECK_HTTP_CODE=$(echo "$CHECK_RESPONSE" | tail -n1)
             
-            echo "中文总结已推送至钉钉，版本号已更新"
+            if [ "$CHECK_HTTP_CODE" = "200" ]; then
+              # 变量存在：更新
+              echo "更新仓库变量为 $LATEST_VERSION"
+              curl -s -X PUT -H "Authorization: token $PAT_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION" \
+                -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
+            else
+              # 变量不存在：创建
+              echo "创建仓库变量 OPENCLAW_LAST_VERSION，值为 $LATEST_VERSION"
+              curl -s -X POST -H "Authorization: token $PAT_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$REPO/actions/variables" \
+                -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
+            fi
+            
+            echo "中文总结已推送至钉钉，版本号已保存"
           else
-            echo "无新版本，无需推送"
+            echo "无新版本（当前版本：$LATEST_VERSION），无需推送"
           fi
