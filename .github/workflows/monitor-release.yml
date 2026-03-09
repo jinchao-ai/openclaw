@@ -8,72 +8,104 @@ jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     steps:
-      # 1. 安装依赖
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      # 1. 安装依赖（jq+翻译工具）
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl
+          # 安装开源翻译工具（无需密钥）
+          sudo wget -O /usr/local/bin/translate https://raw.githubusercontent.com/soimort/translate-shell/master/translate
+          sudo chmod +x /usr/local/bin/translate
 
-      # 2. 获取原仓库最新版本
-      - name: Get latest release from original repo
+      # 2. 获取原仓库最新版本+英文转中文总结
+      - name: Get latest release and translate to Chinese
         id: get-latest
         run: |
-          LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null"}')
+          # 获取原仓库最新Release原始数据
+          LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null","name":"No Title","body":"No Description","html_url":"https://github.com/openclaw/openclaw"}')
+          
+          # 提取核心英文字段
           LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
-          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          echo "最新版本号：$LATEST_VERSION"
+          LATEST_TITLE_EN=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
+          LATEST_BODY_EN=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"')
+          LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
 
-      # 3. 读取历史版本号（用PAT调用API，兼容所有版本）
+          # ========== 核心：英文转中文 + 结构化总结（单行拼接，避免YAML语法错误） ==========
+          # 1. 标题翻译
+          LATEST_TITLE_CN=$(echo "$LATEST_TITLE_EN" | translate -s en:zh-CN | tr -d '\n' || echo "$LATEST_TITLE_EN")
+          
+          # 2. 提取英文核心内容并翻译
+          SUMMARY_EN=$(echo "$LATEST_BODY_EN" | grep -E -i 'performance|feature|bug|fix|security|optimize|new|update|add' | head -5 | tr '\n' ' ')
+          SUMMARY_CN=$(echo "$SUMMARY_EN" | translate -s en:zh-CN | tr -d '\n' || echo "无核心更新内容")
+          
+          # 3. 结构化中文总结（单行拼接，用\n替代换行，避免YAML解析错误）
+          PERF_OPTIMIZE=$(echo "$SUMMARY_CN" | grep -i '性能\|优化\|提速' || echo '无')
+          NEW_FEATURE=$(echo "$SUMMARY_CN" | grep -i '功能\|新增\|支持' || echo '无')
+          BUG_FIX=$(echo "$SUMMARY_CN" | grep -i '修复\|bug\|错误' || echo '无')
+          SECURITY_UPDATE=$(echo "$SUMMARY_CN" | grep -i '安全\|加固\|防护' || echo '无')
+          FINAL_SUMMARY_CN="1. 性能优化：$PERF_OPTIMIZE\n2. 功能新增：$NEW_FEATURE\n3. Bug修复：$BUG_FIX\n4. 安全更新：$SECURITY_UPDATE"
+
+          # 输出为step变量
+          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "title_cn=$LATEST_TITLE_CN" >> $GITHUB_OUTPUT
+          echo "summary_cn=$FINAL_SUMMARY_CN" >> $GITHUB_OUTPUT
+          echo "url=$LATEST_URL" >> $GITHUB_OUTPUT
+
+          # 调试信息
+          echo "版本号：$LATEST_VERSION"
+          echo "中文标题：$LATEST_TITLE_CN"
+          echo "中文总结：$FINAL_SUMMARY_CN"
+
+      # 3. 读取历史版本号（防重复推送）
       - name: Get last notified version
         id: get-last
         env:
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}  # 改用PAT令牌
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # 用GitHub API读取变量（兼容所有版本）
           RESPONSE=$(curl -s -H "Authorization: token $PAT_TOKEN" \
             "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION")
           LAST_VERSION=$(echo "$RESPONSE" | jq -r '.value // ""')
           echo "last_version=$LAST_VERSION" >> $GITHUB_OUTPUT
-          echo "上次推送版本号：$LAST_VERSION"
+          echo "上次推送版本：$LAST_VERSION"
 
-      # 4. 版本对比+发送通知+更新变量
-      - name: Compare version and send DingTalk notify
+      # 4. 发送中文总结到钉钉
+      - name: Send Chinese summary to DingTalk
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           LATEST_VERSION: ${{ steps.get-latest.outputs.latest_version }}
           LAST_VERSION: ${{ steps.get-last.outputs.last_version }}
+          TITLE_CN: ${{ steps.get-latest.outputs.title_cn }}
+          SUMMARY_CN: ${{ steps.get-latest.outputs.summary_cn }}
+          URL: ${{ steps.get-latest.outputs.url }}
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           if [ "$LATEST_VERSION" != "null" ] && [ "$LATEST_VERSION" != "$LAST_VERSION" ]; then
-            echo "检测到新版本 $LATEST_VERSION，开始推送通知..."
+            echo "检测到新版本，推送中文总结到钉钉..."
             
-            # 提取完整版本信息
-            LATEST_RELEASE=$(curl -s "https://api.github.com/repos/openclaw/openclaw/releases/latest")
-            LATEST_TITLE=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
-            LATEST_DESCRIPTION=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | tr -d '"\\' | tr '\n' ' ' | cut -c 1-300)
-            LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
-
-            # 构造合法JSON发送钉钉
+            # 构造中文钉钉消息（用\n实现换行，兼容JSON格式）
             JSON_PAYLOAD=$(jq -n \
               --arg ver "$LATEST_VERSION" \
-              --arg title "$LATEST_TITLE" \
-              --arg desc "$LATEST_DESCRIPTION" \
-              --arg url "$LATEST_URL" \
+              --arg title "$TITLE_CN" \
+              --arg summary "$SUMMARY_CN" \
+              --arg url "$URL" \
               '{
                 "msgtype":"text",
-                "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($ver)\n标题：\($title)\n更新内容：\($desc)\n查看详情：\($url)"}
+                "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($ver)\n版本标题：\($title)\n核心更新（中文总结）：\n\($summary)\n查看完整详情：\($url)"}
               }')
 
+            # 发送钉钉通知
             curl -X POST "$DINGTALK_WEBHOOK" \
               -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
 
-            # 更新仓库变量（用PAT授权，无权限兼容问题）
-            echo "更新上次推送版本号为：$LATEST_VERSION"
+            # 更新版本号到仓库变量
             curl -s -X PUT -H "Authorization: token $PAT_TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION" \
               -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
+            
+            echo "中文总结已推送至钉钉，版本号已更新"
           else
-            echo "无新版本（当前版本：$LATEST_VERSION），无需推送"
+            echo "无新版本，无需推送"
           fi
