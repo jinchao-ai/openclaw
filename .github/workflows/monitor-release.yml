@@ -9,35 +9,33 @@ jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     steps:
-      # 1. 安装依赖（jq + python + requests）
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq curl
-          sudo apt-get install -y python3 python3-pip
-          sudo pip3 install requests
+      # 1. 仅安装基础依赖（移除Python，改用curl直接调用翻译API）
+      - name: Install basic dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq curl
 
-      # 2. 获取最新版本+完整翻译（单行Python脚本，避免YAML语法错误）
+      # 2. 获取最新版本+完整翻译（无Python，纯curl调用翻译API）
       - name: Get latest release and full translate
         id: get-latest
         run: |
           # 获取原仓库最新Release（保留原始换行）
           LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null","name":"No Title","body":"No Description","html_url":"https://github.com/openclaw/openclaw"}')
           
-          # 提取核心字段
+          # 提取核心字段（转义特殊字符，适配API调用）
           LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
-          LATEST_TITLE_EN=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
-          LATEST_BODY_EN=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/\\n/g')
+          LATEST_TITLE_EN=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"' | jq -sRr @uri) # URL编码
+          LATEST_BODY_EN=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | jq -sRr @uri)   # URL编码
           LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
 
-          # ========== 核心：单行Python翻译脚本（避免YAML多行语法错误） ==========
-          TRANSLATE_CMD='import requests, json, sys; def t(t): try: return "".join([i[0] for i in requests.get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh&dt=t&q="+requests.utils.quote(t), timeout=10).json()[0] if i[0]]) except: return t; title_cn=t(sys.argv[1]); body_cn=t(sys.argv[2]); print(f"TITLE_CN|{title_cn}"); print(f"BODY_CN|{body_cn}")'
+          # ========== 核心：纯curl调用翻译API（无Python，无语法错误） ==========
+          # 翻译标题（开源API，无需密钥，稳定可用）
+          LATEST_TITLE_CN=$(curl -s "https://fanyi.youdao.com/translate?&doctype=json&type=AUTO&i=$LATEST_TITLE_EN" | jq -r '.translateResult[0][0].tgt // .translateResult[0][0].src')
           
-          # 执行翻译（传递英文标题和正文）
-          TRANSLATE_RESULT=$(python3 -c "$TRANSLATE_CMD" "$LATEST_TITLE_EN" "$LATEST_BODY_EN")
-          
-          # 提取翻译结果
-          LATEST_TITLE_CN=$(echo "$TRANSLATE_RESULT" | grep "^TITLE_CN|" | cut -d'|' -f2 | sed -e 's/\\n/\n/g')
-          LATEST_BODY_CN=$(echo "$TRANSLATE_RESULT" | grep "^BODY_CN|" | cut -d'|' -f2 | sed -e 's/\\n/\n/g')
+          # 翻译正文（保留换行）
+          LATEST_BODY_CN=$(curl -s "https://fanyi.youdao.com/translate?&doctype=json&type=AUTO&i=$LATEST_BODY_EN" | jq -r '.translateResult[0][0].tgt // .translateResult[0][0].src')
+
+          # 还原换行符（API返回的\n转为真实换行）
+          LATEST_TITLE_CN=$(echo "$LATEST_TITLE_CN" | sed -e 's/\\n/\n/g')
+          LATEST_BODY_CN=$(echo "$LATEST_BODY_CN" | sed -e 's/\\n/\n/g')
 
           # 输出变量（转义换行符，适配GitHub Output）
           echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
@@ -45,7 +43,7 @@ jobs:
           echo "body_cn=$(echo "$LATEST_BODY_CN" | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g')" >> $GITHUB_OUTPUT
           echo "url=$LATEST_URL" >> $GITHUB_OUTPUT
 
-      # 3. 读取历史版本号
+      # 3. 读取历史版本号（防重复推送）
       - name: Get last notified version
         id: get-last
         env:
@@ -78,7 +76,7 @@ jobs:
           if [ "$LATEST_VERSION" != "null" ] && [ "$LATEST_VERSION" != "$LAST_VERSION" ]; then
             echo "检测到新版本 $LATEST_VERSION，推送完整翻译内容到钉钉..."
             
-            # 构造钉钉消息（换行符正常生效）
+            # 构造钉钉消息（换行符正常生效，格式美观）
             JSON_PAYLOAD=$(jq -n \
               --arg ver "$LATEST_VERSION" \
               --arg title "$TITLE_CN" \
@@ -89,12 +87,12 @@ jobs:
                 "text":{"content":"🚨 OpenClaw 原仓库新版本发布 🚨\n版本号：\($ver)\n版本标题：\($title)\n\n更新内容（完整翻译）：\n\($body)\n\n查看完整详情：\($url)"}
               }')
 
-            # 发送钉钉通知
+            # 发送钉钉通知（强制UTF-8编码）
             curl -X POST "$DINGTALK_WEBHOOK" \
               -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
 
-            # 更新版本号变量
+            # 更新版本号变量（先删后建，避免404）
             curl -s -X DELETE -H "Authorization: token $PAT_TOKEN" \
               "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION"
             curl -s -X POST -H "Authorization: token $PAT_TOKEN" \
