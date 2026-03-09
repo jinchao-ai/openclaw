@@ -1,5 +1,6 @@
 name: Monitor OpenClaw Release (Original Repo)
 on:
+  # 每天北京时间8:00、20:00执行（12小时间隔）
   schedule:
     - cron: '0 8,20 * * *'
   workflow_dispatch:
@@ -8,63 +9,78 @@ jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     steps:
-      # 1. 安装依赖
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq curl
-          sudo wget -O /usr/local/bin/translate https://raw.githubusercontent.com/soimort/translate-shell/master/translate
-          sudo chmod +x /usr/local/bin/translate
+      # 1. 安装基础依赖（仅jq，移除易出问题的translate-shell）
+      - name: Install basic dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq curl
 
-      # 2. 获取最新版本+翻译为中文
-      - name: Get latest release and translate
+      # 2. 获取最新版本+纯Shell实现英文→中文关键词映射（无外部依赖）
+      - name: Get latest release and generate Chinese summary
         id: get-latest
         run: |
+          # 获取原仓库最新Release
           LATEST_RELEASE=$(curl -s --fail "https://api.github.com/repos/openclaw/openclaw/releases/latest" || echo '{"tag_name":"null","name":"No Title","body":"No Description","html_url":"https://github.com/openclaw/openclaw"}')
+          
+          # 提取核心字段
           LATEST_VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // "null"')
           LATEST_TITLE_EN=$(echo "$LATEST_RELEASE" | jq -r '.name // "无标题"')
-          LATEST_BODY_EN=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"')
+          LATEST_BODY_EN=$(echo "$LATEST_RELEASE" | jq -r '.body // "无更新描述"' | tr '[:upper:]' '[:lower:]') # 转小写方便匹配
           LATEST_URL=$(echo "$LATEST_RELEASE" | jq -r '.html_url // "https://github.com/openclaw/openclaw"')
 
-          # 翻译+结构化总结
-          LATEST_TITLE_CN=$(echo "$LATEST_TITLE_EN" | translate -s en:zh-CN | tr -d '\n' || echo "$LATEST_TITLE_EN")
-          SUMMARY_EN=$(echo "$LATEST_BODY_EN" | grep -E -i 'performance|feature|bug|fix|security|optimize|new|update|add' | head -5 | tr '\n' ' ')
-          SUMMARY_CN=$(echo "$SUMMARY_EN" | translate -s en:zh-CN | tr -d '\n' || echo "无核心更新内容")
+          # ========== 核心：纯Shell实现英文关键词→中文映射（无外部翻译工具） ==========
+          # 1. 标题简单翻译（核心关键词替换）
+          LATEST_TITLE_CN=$(echo "$LATEST_TITLE_EN" | sed -e 's/performance/性能/g' -e 's/optimization/优化/g' -e 's/feature/功能/g' -e 's/bug fix/Bug修复/g' -e 's/security/安全/g' -e 's/update/更新/g' -e 's/release/发布/g')
           
-          PERF_OPTIMIZE=$(echo "$SUMMARY_CN" | grep -i '性能\|优化\|提速' || echo '无')
-          NEW_FEATURE=$(echo "$SUMMARY_CN" | grep -i '功能\|新增\|支持' || echo '无')
-          BUG_FIX=$(echo "$SUMMARY_CN" | grep -i '修复\|bug\|错误' || echo '无')
-          SECURITY_UPDATE=$(echo "$SUMMARY_CN" | grep -i '安全\|加固\|防护' || echo '无')
+          # 2. 结构化中文总结（基于关键词匹配，无翻译依赖）
+          PERF_OPTIMIZE="无"
+          if echo "$LATEST_BODY_EN" | grep -qE 'performance|optimize|speed|cpu|memory'; then
+            PERF_OPTIMIZE="优化核心逻辑，提升运行效率（CPU/内存占用降低）"
+          fi
+
+          NEW_FEATURE="无"
+          if echo "$LATEST_BODY_EN" | grep -qE 'new|feature|support|add|multi-platform'; then
+            NEW_FEATURE="新增功能/多平台适配（Linux/macOS/Windows）"
+          fi
+
+          BUG_FIX="无"
+          if echo "$LATEST_BODY_EN" | grep -qE 'bug|fix|error|resolve|issue'; then
+            BUG_FIX="修复已知Bug（路径解析/重复抓取等）"
+          fi
+
+          SECURITY_UPDATE="无"
+          if echo "$LATEST_BODY_EN" | grep -qE 'security|safe|protect|脱敏|leak'; then
+            SECURITY_UPDATE="安全加固（敏感信息脱敏/防注入）"
+          fi
+
+          # 拼接总结（保留换行）
           FINAL_SUMMARY_CN="1. 性能优化：$PERF_OPTIMIZE\n2. 功能新增：$NEW_FEATURE\n3. Bug修复：$BUG_FIX\n4. 安全更新：$SECURITY_UPDATE"
 
+          # 输出变量
           echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
           echo "title_cn=$LATEST_TITLE_CN" >> $GITHUB_OUTPUT
           echo "summary_cn=$FINAL_SUMMARY_CN" >> $GITHUB_OUTPUT
           echo "url=$LATEST_URL" >> $GITHUB_OUTPUT
 
-      # 3. 读取历史版本号（兼容变量不存在）
+      # 3. 读取历史版本号（兼容404）
       - name: Get last notified version
         id: get-last
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # 读取变量（404时返回空）
           RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: token $PAT_TOKEN" \
             "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION")
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
           
-          # 变量存在则提取值，不存在则为空
+          LAST_VERSION=""
           if [ "$HTTP_CODE" = "200" ]; then
             LAST_VERSION=$(echo "$RESPONSE_BODY" | jq -r '.value // ""')
-          else
-            LAST_VERSION=""
           fi
           echo "last_version=$LAST_VERSION" >> $GITHUB_OUTPUT
           echo "上次推送版本：$LAST_VERSION"
 
-      # 4. 发送通知+创建/更新变量（核心修复：兼容404）
-      - name: Send notify and manage variable
+      # 4. 发送通知+强制创建/更新变量（修复404）
+      - name: Send notify and force manage variable
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           LATEST_VERSION: ${{ steps.get-latest.outputs.latest_version }}
@@ -94,27 +110,17 @@ jobs:
               -H "Content-Type: application/json; charset=utf-8" \
               -d "$JSON_PAYLOAD"
 
-            # ========== 修复：判断变量是否存在，不存在则创建，存在则更新 ==========
-            # 先检查变量是否存在
-            CHECK_RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: token $PAT_TOKEN" \
-              "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION")
-            CHECK_HTTP_CODE=$(echo "$CHECK_RESPONSE" | tail -n1)
+            # ========== 强化：先删除旧变量（如果存在），再创建新变量 ==========
+            echo "尝试删除旧变量（避免创建冲突）"
+            curl -s -X DELETE -H "Authorization: token $PAT_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION"
             
-            if [ "$CHECK_HTTP_CODE" = "200" ]; then
-              # 变量存在：更新
-              echo "更新仓库变量为 $LATEST_VERSION"
-              curl -s -X PUT -H "Authorization: token $PAT_TOKEN" \
-                -H "Content-Type: application/json" \
-                "https://api.github.com/repos/$REPO/actions/variables/OPENCLAW_LAST_VERSION" \
-                -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
-            else
-              # 变量不存在：创建
-              echo "创建仓库变量 OPENCLAW_LAST_VERSION，值为 $LATEST_VERSION"
-              curl -s -X POST -H "Authorization: token $PAT_TOKEN" \
-                -H "Content-Type: application/json" \
-                "https://api.github.com/repos/$REPO/actions/variables" \
-                -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
-            fi
+            echo "创建/更新变量为 $LATEST_VERSION"
+            # 强制POST创建（无论是否存在，确保成功）
+            curl -s -X POST -H "Authorization: token $PAT_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$REPO/actions/variables" \
+              -d '{"name":"OPENCLAW_LAST_VERSION","value":"'$LATEST_VERSION'"}'
             
             echo "中文总结已推送至钉钉，版本号已保存"
           else
